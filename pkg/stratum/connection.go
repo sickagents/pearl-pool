@@ -49,3 +49,8 @@ func (c *Connection) UpdateActivity() {
 	defer c.mu.Unlock()
 	c.lastActivity = time.Now()
 }
+
+// generateExtraNonce1 generates a unique 4-byte extranonce1
+func generateExtraNonce1() string {
+	return uuid.New().String()[:8]
+}

@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/pearl-mining/pearl-pool/pkg/accounting"
 	"github.com/pearl-mining/pearl-pool/pkg/config"
 	"github.com/pearl-mining/pearl-pool/pkg/pool"
 	"github.com/pearl-mining/pearl-pool/pkg/rpc"
@@ -15,7 +15,6 @@ import (
 	"github.com/pearl-mining/pearl-pool/pkg/stratum"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-)
 )
 
 func main() {
@@ -106,23 +105,17 @@ func main() {
 	// Start Stratum servers
 	var servers []*stratum.Server
 	for _, portCfg := range cfg.Stratum.Ports {
-		server := stratum.NewServer(portCfg.Port, portCfg.Difficulty, jobManager)
-		
-		// Inject dependencies
-		// Start Stratum servers
-		var servers []*stratum.Server
-		for _, portCfg := range cfg.Stratum.Ports {
-			server := stratum.NewServer(portCfg.Port, portCfg.Difficulty, jobManager, pgStore, rpcClient)
-			if err := server.Start(); err != nil {
-				log.Fatal().Err(err).Int("port", portCfg.Port).Msg("Failed to start Stratum server")
-			}
-			servers = append(servers, server)
+		server := stratum.NewServer(portCfg.Port, portCfg.Difficulty, jobManager, pgStore, rpcClient)
+		if err := server.Start(); err != nil {
+			log.Fatal().Err(err).Int("port", portCfg.Port).Msg("Failed to start Stratum server")
 		}
+		servers = append(servers, server)
+	}
 	
-		// Start block monitor
-		blockMonitor := pool.NewBlockMonitor(rpcClient, pgStore, cfg.Pool.ConfirmationDepth, 60*time.Second)
-		blockMonitor.Start()
-		defer blockMonitor.Stop()
+	// Start block monitor
+	blockMonitor := pool.NewBlockMonitor(rpcClient, pgStore, cfg.Pool.ConfirmationDepth, 60*time.Second)
+	blockMonitor.Start()
+	defer blockMonitor.Stop()
 	
 	// Start block confirmation loop
 	confirmationLoop := NewBlockConfirmationLoop(

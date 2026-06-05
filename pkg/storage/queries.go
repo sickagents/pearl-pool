@@ -77,3 +77,32 @@ type Payout struct {
 	Status    string
 	CreatedAt time.Time
 }
+
+type PoolStats struct {
+	TotalShares   int64
+	ActiveMiners  int
+	TotalBlocks   int64
+	PendingBlocks int
+}
+
+func (s *PostgresStore) GetPoolStats() (*PoolStats, error) {
+	stats := &PoolStats{}
+	
+	// Count total shares in last 24 hours
+	query := `SELECT COUNT(*) FROM shares WHERE created_at > NOW() - INTERVAL '24 hours'`
+	s.db.QueryRow(query).Scan(&stats.TotalShares)
+	
+	// Count active miners (miners with shares in last hour)
+	query = `SELECT COUNT(DISTINCT address) FROM shares WHERE created_at > NOW() - INTERVAL '1 hour'`
+	s.db.QueryRow(query).Scan(&stats.ActiveMiners)
+	
+	// Count total blocks
+	query = `SELECT COUNT(*) FROM blocks`
+	s.db.QueryRow(query).Scan(&stats.TotalBlocks)
+	
+	// Count pending blocks
+	query = `SELECT COUNT(*) FROM blocks WHERE status IN ('pending', 'confirming')`
+	s.db.QueryRow(query).Scan(&stats.PendingBlocks)
+	
+	return stats, nil
+}

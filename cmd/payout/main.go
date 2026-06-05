@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/pearl-mining/pearl-pool/pkg/config"
 	"github.com/pearl-mining/pearl-pool/pkg/payout"

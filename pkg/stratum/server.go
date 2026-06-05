@@ -363,5 +363,5 @@ func (s *Server) BroadcastJob(job *Job) {
 		s.sendMessage(conn, msg)
 	}
 	
-	log.Info().Str("job_id", job.JobID).Int64("height", job.Height).Msg("Broadcasted new job")
+	log.Info().Str("job_id", job.ID).Int64("height", job.Height).Msg("Broadcasted new job")
 }
