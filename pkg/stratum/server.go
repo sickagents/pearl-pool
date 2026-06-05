@@ -3,14 +3,16 @@ package stratum
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 
-	"github.com/pearl-mining/pearl-pool/pkg/metrics"
+	"github.com/rs/zerolog/log"
+)
 	"github.com/rs/zerolog/log"
 )
 
