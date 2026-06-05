@@ -15,6 +15,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+type API struct {
+	pgStore    *storage.PostgresStore
+	redisStore *storage.RedisStore
+	router     *mux.Router
+}
+
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
@@ -50,39 +56,19 @@ func main() {
 	}
 	defer redisStore.Close()
 	
-	api := NewAPI(cfg, pgStore, redisStore)
-	
-	router := mux.NewRouter()
-	
-	// Pool stats
-	router.HandleFunc("/api/pool/stats", api.GetPoolStats).Methods("GET")
-	router.HandleFunc("/api/pool/blocks", api.GetRecentBlocks).Methods("GET")
-	
-	// Miner stats
-	router.HandleFunc("/api/miner/{address}", api.GetMinerStats).Methods("GET")
-	router.HandleFunc("/api/miner/{address}/workers", api.GetMinerWorkers).Methods("GET")
-	router.HandleFunc("/api/miner/{address}/payments", api.GetMinerPayments).Methods("GET")
-	
-	// Metrics
-	if cfg.API.EnableMetrics {
-		router.Handle(cfg.API.MetricsPath, promhttp.Handler())
+	api := &API{
+		pgStore:    pgStore,
+		redisStore: redisStore,
+		router:     mux.NewRouter(),
 	}
 	
-	// CORS
-	if cfg.API.CORSEnabled {
-		router.Use(corsMiddleware(cfg.API.CORSOrigins))
-	}
+	api.setupRoutes()
 	
 	addr := cfg.API.Host + ":" + string(rune(cfg.API.Port))
 	log.Info().Str("addr", addr).Msg("API server listening")
 	
-	server := &http.Server{
-		Addr:    addr,
-		Handler: router,
-	}
-	
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := http.ListenAndServe(addr, api.router); err != nil {
 			log.Fatal().Err(err).Msg("API server failed")
 		}
 	}()
@@ -94,123 +80,95 @@ func main() {
 	log.Info().Msg("API server stopped")
 }
 
-type API struct {
-	cfg        *config.Config
-	pgStore    *storage.PostgresStore
-	redisStore *storage.RedisStore
+func (a *API) setupRoutes() {
+	// Pool stats
+	a.router.HandleFunc("/api/pool/stats", a.handlePoolStats).Methods("GET")
+	a.router.HandleFunc("/api/pool/blocks", a.handlePoolBlocks).Methods("GET")
+	
+	// Miner stats
+	a.router.HandleFunc("/api/miner/{address}", a.handleMinerStats).Methods("GET")
+	a.router.HandleFunc("/api/miner/{address}/workers", a.handleMinerWorkers).Methods("GET")
+	a.router.HandleFunc("/api/miner/{address}/payments", a.handleMinerPayments).Methods("GET")
+	
+	// Metrics
+	a.router.Handle("/metrics", promhttp.Handler())
+	
+	// Health
+	a.router.HandleFunc("/health", a.handleHealth).Methods("GET")
 }
 
-func NewAPI(cfg *config.Config, pg *storage.PostgresStore, redis *storage.RedisStore) *API {
-	return &API{
-		cfg:        cfg,
-		pgStore:    pg,
-		redisStore: redis,
-	}
-}
-
-func (a *API) GetPoolStats(w http.ResponseWriter, r *http.Request) {
+func (a *API) handlePoolStats(w http.ResponseWriter, r *http.Request) {
 	hashrate, _ := a.redisStore.GetPoolHashrate()
 	
-	// TODO: Get from storage
+	blocks, _ := a.pgStore.GetRecentBlocks(10)
+	
 	stats := map[string]interface{}{
-		"hashrate":    hashrate,
-		"miners":      0,
-		"workers":     0,
-		"blocks":      0,
-		"fee":         a.cfg.Pool.Fee,
-		"minPayout":   a.cfg.Pool.MinPayout,
-		"rewardMode":  a.cfg.Pool.RewardMode,
+		"hashrate":     hashrate,
+		"blocks_found": len(blocks),
 	}
 	
-	respondJSON(w, stats)
+	json.NewEncoder(w).Encode(stats)
 }
 
-func (a *API) GetRecentBlocks(w http.ResponseWriter, r *http.Request) {
-	blocks, err := a.pgStore.GetPendingBlocks()
+func (a *API) handlePoolBlocks(w http.ResponseWriter, r *http.Request) {
+	blocks, err := a.pgStore.GetRecentBlocks(50)
 	if err != nil {
-		respondError(w, 500, "Failed to fetch blocks")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	
-	respondJSON(w, blocks)
+	json.NewEncoder(w).Encode(blocks)
 }
 
-func (a *API) GetMinerStats(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleMinerStats(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	address := vars["address"]
 	
 	hashrate, _ := a.redisStore.GetMinerHashrate(address)
 	shares, _ := a.redisStore.GetShareCount(address)
+	balance, _ := a.pgStore.GetBalance(address)
 	
 	stats := map[string]interface{}{
 		"address":  address,
 		"hashrate": hashrate,
 		"shares":   shares,
+		"balance":  balance,
 	}
 	
-	respondJSON(w, stats)
+	json.NewEncoder(w).Encode(stats)
 }
 
-func (a *API) GetMinerWorkers(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleMinerWorkers(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	address := vars["address"]
 	
 	workers, err := a.redisStore.GetOnlineWorkers(address)
 	if err != nil {
-		respondError(w, 500, "Failed to fetch workers")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	
-	respondJSON(w, map[string]interface{}{"workers": workers})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"workers": workers,
+	})
 }
 
-func (a *API) GetMinerPayments(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleMinerPayments(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	address := vars["address"]
 	
-	// TODO: Implement GetPaymentsByAddress in storage
-	_ = address
-	
-	respondJSON(w, []interface{}{})
-}
-
-func respondJSON(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
-func respondError(w http.ResponseWriter, code int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
-}
-
-func corsMiddleware(origins []string) mux.MiddlewareFunc {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			origin := r.Header.Get("Origin")
-			
-			// Check if origin is allowed
-			allowed := false
-			for _, o := range origins {
-				if o == "*" || o == origin {
-					allowed = true
-					break
-				}
-			}
-			
-			if allowed {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			}
-			
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			
-			next.ServeHTTP(w, r)
-		})
+	payments, err := a.pgStore.GetPaymentHistory(address, 50)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	
+	json.NewEncoder(w).Encode(payments)
+}
+
+func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+	})
 }

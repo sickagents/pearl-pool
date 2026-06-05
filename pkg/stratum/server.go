@@ -2,17 +2,19 @@ package stratum
 
 import (
 	"bufio"
-	"context"
-	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"net"
-	"sync"
-	"time"
+	import (
+		"bufio"
+		"context"
+		"encoding/json"
+		"fmt"
+		"net"
+		"sync"
+		"time"
 
-	"github.com/rs/zerolog/log"
-)
+		"github.com/pearl-mining/pearl-pool/pkg/rpc"
+		"github.com/pearl-mining/pearl-pool/pkg/storage"
+		"github.com/rs/zerolog/log"
+	)
 
 type Server struct {
 	port       int
@@ -21,18 +23,22 @@ type Server struct {
 	connsMu    sync.RWMutex
 	jobManager *JobManager
 	difficulty float64
+	pgStore    *storage.PostgresStore
+	rpcClient  *rpc.Client
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 }
 
-func NewServer(port int, difficulty float64, jobManager *JobManager) *Server {
+func NewServer(port int, difficulty float64, jobManager *JobManager, pgStore *storage.PostgresStore, rpcClient *rpc.Client) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		port:       port,
 		conns:      make(map[string]*Connection),
 		jobManager: jobManager,
 		difficulty: difficulty,
+		pgStore:    pgStore,
+		rpcClient:  rpcClient,
 		ctx:        ctx,
 		cancel:     cancel,
 	}

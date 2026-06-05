@@ -2,128 +2,155 @@ package stratum
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"strconv"
+	"time"
 )
 
-// ValidateShare checks if a submitted share is valid
-func ValidateShare(job *Job, nonce uint32, extraNonce2 string, ntime int64, minerAddress string, difficulty float64) (*Share, error) {
-	// Decode extranonce2
-	extraNonce2Bytes, err := hex.DecodeString(extraNonce2)
+// ValidateShare validates a submitted share
+func (s *Server) validateShare(conn *Connection, jobID, extraNonce2Hex, nTimeHex, nonceHex string) (*ShareValidation, error) {
+	job, exists := s.jobManager.GetJob(jobID)
+	if !exists {
+		return nil, fmt.Errorf("job not found")
+	}
+	
+	// Parse nonce
+	nonceBytes, err := hex.DecodeString(nonceHex)
 	if err != nil {
-		return nil, fmt.Errorf("invalid extranonce2: %w", err)
+		return nil, fmt.Errorf("invalid nonce")
+	}
+	if len(nonceBytes) != 4 {
+		return nil, fmt.Errorf("nonce must be 4 bytes")
+	}
+	nonce := uint32(nonceBytes[0])<<24 | uint32(nonceBytes[1])<<16 | uint32(nonceBytes[2])<<8 | uint32(nonceBytes[3])
+	
+	// Parse nTime
+	nTime, err := strconv.ParseInt(nTimeHex, 16, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ntime")
 	}
 	
-	// Build block header
-	// TODO: This is simplified - need proper coinbase construction
-	header := buildBlockHeader(job, nonce, extraNonce2Bytes, ntime)
-	
-	// Compute hash
-	hash := sha256.Sum256(header)
-	hash = sha256.Sum256(hash[:]) // Double SHA256
-	
-	// Convert hash to big-endian for comparison
-	hashBig := reverseBytes(hash[:])
-	
-	// Check against difficulty
-	shareDiff := hashToDifficulty(hashBig)
-	
-	if shareDiff < difficulty {
-		return nil, fmt.Errorf("share difficulty too low: got %.2f, need %.2f", shareDiff, difficulty)
+	// Check nTime range
+	if nTime < job.CurTime-7200 || nTime > time.Now().Unix()+7200 {
+		return nil, fmt.Errorf("ntime out of range")
 	}
 	
-	// Check if meets network target
-	isBlock := false
-	var blockHash string
-	
-	if job.Target != nil {
-		hashInt := bytesToBigInt(hashBig)
-		if hashInt.Cmp(job.Target) <= 0 {
-			isBlock = true
-			blockHash = hex.EncodeToString(hashBig)
-		}
+	// Parse extraNonce2
+	extraNonce2, err := hex.DecodeString(extraNonce2Hex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid extranonce2")
+	}
+	if len(extraNonce2) != conn.extraNonce2Size {
+		return nil, fmt.Errorf("extranonce2 wrong size")
 	}
 	
-	share := &Share{
-		JobID:      job.ID,
-		Miner:      minerAddress,
-		Nonce:      nonce,
-		ExtraNonce: extraNonce2,
-		Time:       ntime,
-		Difficulty: shareDiff,
-		Height:     job.Height,
-		IsBlock:    isBlock,
-		BlockHash:  blockHash,
+	// Build block header (simplified - production needs proper coinbase construction)
+	// For PEARL, we'd need to construct:
+	// - Coinbase transaction with extraNonce1 + extraNonce2
+	// - Merkle root from [coinbase] + job.Transactions
+	// - Block header with all fields
+	
+	// TODO: Implement full block header construction
+	blockHeader := s.buildBlockHeader(job, conn.extraNonce1, extraNonce2Hex, nTimeHex, nonceHex)
+	
+	// Hash the header
+	hash := s.hashBlockHeader(blockHeader)
+	
+	// Convert hash to big.Int for comparison
+	hashBig := new(big.Int).SetBytes(reverseBytes(hash))
+	
+	// Check against miner difficulty
+	minerTarget := s.difficultyToTarget(conn.difficulty)
+	meetsPoolDiff := hashBig.Cmp(minerTarget) <= 0
+	
+	if !meetsPoolDiff {
+		return &ShareValidation{
+			Valid:       false,
+			IsBlock:     false,
+			Difficulty:  conn.difficulty,
+			BlockHash:   "",
+		}, nil
 	}
 	
-	return share, nil
+	// Check against network difficulty
+	meetsNetworkDiff := hashBig.Cmp(job.Target) <= 0
+	
+	return &ShareValidation{
+		Valid:       true,
+		IsBlock:     meetsNetworkDiff,
+		Difficulty:  conn.difficulty,
+		BlockHash:   hex.EncodeToString(hash),
+		BlockHeight: job.Height,
+		BlockHex:    hex.EncodeToString(blockHeader),
+	}, nil
 }
 
-func buildBlockHeader(job *Job, nonce uint32, extraNonce2 []byte, ntime int64) []byte {
-	// Bitcoin block header format:
-	// version (4) + prevhash (32) + merkleroot (32) + time (4) + bits (4) + nonce (4) = 80 bytes
-	// PEARL adds: proof commitment + certificate
+type ShareValidation struct {
+	Valid       bool
+	IsBlock     bool
+	Difficulty  float64
+	BlockHash   string
+	BlockHeight int64
+	BlockHex    string
+}
+
+// buildBlockHeader constructs a block header (simplified)
+func (s *Server) buildBlockHeader(job *Job, extraNonce1, extraNonce2, nTime, nonce string) []byte {
+	// PEARL block header structure (similar to Bitcoin):
+	// - version (4 bytes)
+	// - prev_block_hash (32 bytes)
+	// - merkle_root (32 bytes)
+	// - timestamp (4 bytes)
+	// - bits (4 bytes)
+	// - nonce (4 bytes)
+	// Total: 80 bytes
 	
-	header := make([]byte, 0, 80)
+	// This is a placeholder - production needs proper implementation
+	header := make([]byte, 80)
 	
-	// Version (placeholder)
-	version := make([]byte, 4)
-	binary.LittleEndian.PutUint32(version, 1)
-	header = append(header, version...)
-	
-	// Previous block hash
-	prevHash, _ := hex.DecodeString(job.PrevHash)
-	header = append(header, reverseBytes(prevHash)...)
-	
-	// Merkle root (placeholder - needs proper coinbase + tx merkle tree)
-	merkleRoot := make([]byte, 32)
-	header = append(header, merkleRoot...)
-	
-	// Time
-	timeBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(timeBytes, uint32(ntime))
-	header = append(header, timeBytes...)
-	
-	// Bits
-	bitsBytes, _ := hex.DecodeString(job.Bits)
-	header = append(header, bitsBytes...)
-	
-	// Nonce
-	nonceBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(nonceBytes, nonce)
-	header = append(header, nonceBytes...)
+	// TODO: Implement proper header construction with:
+	// - Coinbase transaction (with extraNonce1 + extraNonce2)
+	// - Merkle tree calculation
+	// - All header fields
 	
 	return header
 }
 
+// hashBlockHeader computes SHA256d hash
+func (s *Server) hashBlockHeader(header []byte) []byte {
+	first := sha256.Sum256(header)
+	second := sha256.Sum256(first[:])
+	return second[:]
+}
+
+// difficultyToTarget converts difficulty to target
+func (s *Server) difficultyToTarget(difficulty float64) *big.Int {
+	// diff = max_target / target
+	// target = max_target / diff
+	
+	maxTarget := new(big.Int).SetBytes([]byte{
+		0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	})
+	
+	diffBig := new(big.Float).SetFloat64(difficulty)
+	maxTargetFloat := new(big.Float).SetInt(maxTarget)
+	
+	targetFloat := new(big.Float).Quo(maxTargetFloat, diffBig)
+	target, _ := targetFloat.Int(nil)
+	
+	return target
+}
+
+// reverseBytes reverses byte slice (for endianness)
 func reverseBytes(b []byte) []byte {
-	r := make([]byte, len(b))
-	for i := 0; i < len(b); i++ {
-		r[i] = b[len(b)-1-i]
+	reversed := make([]byte, len(b))
+	for i := range b {
+		reversed[i] = b[len(b)-1-i]
 	}
-	return r
-}
-
-func hashToDifficulty(hash []byte) float64 {
-	// Simplified difficulty calculation
-	// Real implementation: diff = maxTarget / currentTarget
-	if len(hash) < 32 {
-		return 0
-	}
-	
-	// Get first 8 bytes as uint64
-	val := binary.BigEndian.Uint64(hash[:8])
-	if val == 0 {
-		return 0
-	}
-	
-	// Difficulty is inversely proportional to hash value
-	maxVal := float64(^uint64(0))
-	return maxVal / float64(val)
-}
-
-func bytesToBigInt(b []byte) *big.Int {
-	return new(big.Int).SetBytes(b)
+	return reversed
 }
