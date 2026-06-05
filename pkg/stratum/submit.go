@@ -3,7 +3,9 @@ package stratum
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	
+	"github.com/pearl-mining/pearl-pool/pkg/metrics"
 	"github.com/pearl-mining/pearl-pool/pkg/storage"
 	"github.com/rs/zerolog/log"
 )
@@ -58,6 +60,7 @@ func (s *Server) handleSubmitV2(conn *Connection, msg *StratumMessage) {
 	if s.isStaleJob(job) {
 		s.sendError(conn, msg.ID, 21, "Stale share")
 		conn.sharesRejected++
+		metrics.RecordShareStale(strconv.Itoa(s.port))
 		return
 	}
 	
@@ -65,6 +68,7 @@ func (s *Server) handleSubmitV2(conn *Connection, msg *StratumMessage) {
 	if s.isDuplicateShare(conn, jobID, extraNonce2, nonce) {
 		s.sendError(conn, msg.ID, 22, "Duplicate share")
 		conn.sharesRejected++
+		metrics.RecordShareDuplicate(strconv.Itoa(s.port))
 		return
 	}
 	
@@ -74,12 +78,14 @@ func (s *Server) handleSubmitV2(conn *Connection, msg *StratumMessage) {
 		log.Error().Err(err).Str("conn_id", conn.ID).Msg("Share validation error")
 		s.sendError(conn, msg.ID, 20, fmt.Sprintf("Validation failed: %s", err.Error()))
 		conn.sharesRejected++
+		metrics.RecordShareRejected(strconv.Itoa(s.port), "validation_error")
 		return
 	}
 	
 	if !result.Valid {
 		s.sendError(conn, msg.ID, 23, "Invalid share (low difficulty)")
 		conn.sharesRejected++
+		metrics.RecordShareRejected(strconv.Itoa(s.port), "low_difficulty")
 		return
 	}
 	
@@ -88,6 +94,9 @@ func (s *Server) handleSubmitV2(conn *Connection, msg *StratumMessage) {
 	conn.sharesSubmitted++
 	conn.sharesAccepted++
 	conn.UpdateActivity()
+	
+	// Record metrics
+	metrics.RecordShareAccepted(strconv.Itoa(s.port))
 	
 	// Record to storage
 	if s.pgStore != nil {
@@ -123,8 +132,11 @@ func (s *Server) handleSubmitV2(conn *Connection, msg *StratumMessage) {
 			Int64("height", job.Height).
 			Msg("BLOCK FOUND!")
 		
+		// Record metrics
+		metrics.RecordBlockFound()
+		
 		// Submit block via RPC
-		go s.submitBlock(result.BlockHash, job)
+		go s.submitBlock(result.BlockHash, job, conn.address)
 	}
 	
 	log.Debug().
@@ -136,7 +148,7 @@ func (s *Server) handleSubmitV2(conn *Connection, msg *StratumMessage) {
 		Msg("Share accepted")
 }
 
-func (s *Server) submitBlock(blockHex string, job *Job) {
+func (s *Server) submitBlock(blockHex string, job *Job, finderAddress string) {
 	if s.rpcClient == nil {
 		log.Error().Msg("RPC client not configured, cannot submit block")
 		return
@@ -158,7 +170,7 @@ func (s *Server) submitBlock(blockHex string, job *Job) {
 	
 	// Record block in database
 	if s.pgStore != nil {
-		err := s.pgStore.RecordBlock(blockHex, job.Height, job.CoinbaseValue, "finder_address")
+		err := s.pgStore.RecordBlock(blockHex, job.Height, job.CoinbaseValue, finderAddress)
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to record block")
 		}
