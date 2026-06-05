@@ -2,19 +2,17 @@ package stratum
 
 import (
 	"bufio"
-	import (
-		"bufio"
-		"context"
-		"encoding/json"
-		"fmt"
-		"net"
-		"sync"
-		"time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"sync"
+	"time"
 
-		"github.com/pearl-mining/pearl-pool/pkg/rpc"
-		"github.com/pearl-mining/pearl-pool/pkg/storage"
-		"github.com/rs/zerolog/log"
-	)
+	"github.com/pearl-mining/pearl-pool/pkg/rpc"
+	"github.com/pearl-mining/pearl-pool/pkg/storage"
+	"github.com/rs/zerolog/log"
+)
 
 type Server struct {
 	port       int
@@ -45,9 +43,9 @@ func NewServer(port int, difficulty float64, jobManager *JobManager, pgStore *st
 }
 
 func (s *Server) Start() error {
-	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", s.port))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
 	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %w", s.port, err)
+		return err
 	}
 	s.listener = listener
 	
@@ -64,15 +62,7 @@ func (s *Server) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
-	
-	s.connsMu.Lock()
-	for _, conn := range s.conns {
-		conn.Close()
-	}
-	s.connsMu.Unlock()
-	
 	s.wg.Wait()
-	log.Info().Msg("Stratum server stopped")
 }
 
 func (s *Server) acceptLoop() {
@@ -87,11 +77,13 @@ func (s *Server) acceptLoop() {
 		
 		netConn, err := s.listener.Accept()
 		if err != nil {
-			if s.ctx.Err() != nil {
+			select {
+			case <-s.ctx.Done():
 				return
+			default:
+				log.Error().Err(err).Msg("Accept error")
+				continue
 			}
-			log.Error().Err(err).Msg("Accept failed")
-			continue
 		}
 		
 		conn := NewConnection(netConn, s.difficulty)
@@ -108,32 +100,36 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConnection(conn *Connection) {
 	defer s.wg.Done()
 	defer func() {
-		conn.Close()
+		conn.netConn.Close()
 		s.connsMu.Lock()
 		delete(s.conns, conn.ID)
 		s.connsMu.Unlock()
+		log.Info().Str("conn_id", conn.ID).Msg("Connection closed")
 	}()
 	
-	log.Info().Str("conn_id", conn.ID).Str("remote", conn.RemoteAddr()).Msg("New connection")
+	reader := bufio.NewReader(conn.netConn)
 	
-	scanner := bufio.NewScanner(conn.netConn)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+		
+		conn.netConn.SetReadDeadline(time.Now().Add(300 * time.Second))
+		
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
 		}
 		
 		var msg StratumMessage
-		if err := json.Unmarshal([]byte(line), &msg); err != nil {
-			log.Warn().Str("conn_id", conn.ID).Err(err).Str("line", line).Msg("Invalid JSON")
+		if err := json.Unmarshal(line, &msg); err != nil {
+			log.Warn().Str("conn_id", conn.ID).Err(err).Msg("Invalid JSON")
 			continue
 		}
 		
 		s.handleMessage(conn, &msg)
-	}
-	
-	if err := scanner.Err(); err != nil {
-		log.Error().Str("conn_id", conn.ID).Err(err).Msg("Scanner error")
 	}
 }
 
@@ -148,7 +144,7 @@ func (s *Server) handleMessage(conn *Connection, msg *StratumMessage) {
 	case "mining.extranonce.subscribe":
 		s.handleExtraNonceSubscribe(conn, msg)
 	default:
-		s.sendError(conn, msg.ID, 20, fmt.Sprintf("Unknown method: %s", msg.Method))
+		s.sendError(conn, msg.ID, 20, "Unknown method")
 	}
 }
 
@@ -231,65 +227,92 @@ func (s *Server) handleSubmit(conn *Connection, msg *StratumMessage) {
 		return
 	}
 	
-	ntimeStr, ok := msg.Params[3].(string)
+	nTime, ok := msg.Params[3].(string)
 	if !ok {
 		s.sendError(conn, msg.ID, 24, "Invalid ntime")
 		return
 	}
 	
-	nonceStr, ok := msg.Params[4].(string)
+	nonce, ok := msg.Params[4].(string)
 	if !ok {
 		s.sendError(conn, msg.ID, 24, "Invalid nonce")
 		return
 	}
 	
-	job, exists := s.jobManager.GetJob(jobID)
-	if !exists {
-		s.sendError(conn, msg.ID, 21, "Job not found")
-		return
-	}
-	
-	// Parse nonce and ntime
-	nonceBytes, err := hex.DecodeString(nonceStr)
-	if err != nil || len(nonceBytes) != 4 {
-		s.sendError(conn, msg.ID, 24, "Invalid nonce format")
-		return
-	}
-	nonce := binary.LittleEndian.Uint32(nonceBytes)
-	
-	ntimeBytes, err := hex.DecodeString(ntimeStr)
-	if err != nil || len(ntimeBytes) != 4 {
-		s.sendError(conn, msg.ID, 24, "Invalid ntime format")
-		return
-	}
-	ntime := int64(binary.LittleEndian.Uint32(ntimeBytes))
-	
 	// Validate share
-	share, err := ValidateShare(job, nonce, extraNonce2, ntime, conn.address, conn.difficulty)
+	validation, err := s.validateShare(conn, jobID, extraNonce2, nTime, nonce)
 	if err != nil {
-		s.sendError(conn, msg.ID, 23, err.Error())
+		s.sendError(conn, msg.ID, 20, fmt.Sprintf("Invalid share: %s", err.Error()))
 		conn.sharesRejected++
 		log.Warn().Str("conn_id", conn.ID).Str("address", conn.address).Err(err).Msg("Share rejected")
 		return
 	}
 	
-	share.Worker = workerName
+	if !validation.Valid {
+		s.sendError(conn, msg.ID, 23, "Low difficulty share")
+		conn.sharesRejected++
+		return
+	}
 	
 	// Accept share
 	s.sendResult(conn, msg.ID, true)
-	conn.sharesSubmitted++
 	conn.sharesAccepted++
+	conn.sharesSubmitted++
 	
-	// TODO: Record to storage (pg + redis)
-	// s.storage.RecordShare(share)
-	
-	if share.IsBlock {
-		log.Info().Str("hash", share.BlockHash).Int64("height", share.Height).Str("finder", share.Miner).Msg("BLOCK FOUND!")
-		// TODO: Submit block to node
-		// s.rpcClient.SubmitBlock(blockHex)
+	// Record to storage
+	if s.pgStore != nil {
+		worker := workerName
+		if worker == "" {
+			worker = "default"
+		}
+		
+		err := s.pgStore.RecordShare(
+			conn.address,
+			worker,
+			validation.Difficulty,
+			validation.BlockHeight,
+			validation.IsBlock,
+			validation.BlockHash,
+		)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to record share")
+		}
 	}
 	
-	log.Debug().Str("conn_id", conn.ID).Str("job_id", jobID).Float64("diff", share.Difficulty).Bool("block", share.IsBlock).Msg("Share accepted")
+	// Block found
+	if validation.IsBlock {
+		log.Info().
+			Str("address", conn.address).
+			Str("block_hash", validation.BlockHash).
+			Int64("height", validation.BlockHeight).
+			Msg("BLOCK FOUND!")
+		
+		// Submit to node
+		if s.rpcClient != nil {
+			if err := s.rpcClient.SubmitBlock(validation.BlockHex); err != nil {
+				log.Error().Err(err).Str("hash", validation.BlockHash).Msg("Block submission failed")
+			} else {
+				log.Info().Str("hash", validation.BlockHash).Msg("Block submitted to network")
+			}
+		}
+		
+		// Record block
+		if s.pgStore != nil {
+			// TODO: Get actual block reward from template or RPC
+			reward := int64(100 * 1e8) // 100 PEARL placeholder
+			err := s.pgStore.RecordBlock(validation.BlockHash, validation.BlockHeight, reward, conn.address)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to record block")
+			}
+		}
+	}
+	
+	log.Debug().
+		Str("conn_id", conn.ID).
+		Str("address", conn.address).
+		Str("job_id", jobID).
+		Bool("is_block", validation.IsBlock).
+		Msg("Share accepted")
 }
 
 func (s *Server) handleExtraNonceSubscribe(conn *Connection, msg *StratumMessage) {
@@ -340,9 +363,5 @@ func (s *Server) BroadcastJob(job *Job) {
 		s.sendMessage(conn, msg)
 	}
 	
-	log.Info().Str("job_id", job.ID).Int("connections", len(s.conns)).Msg("Job broadcasted")
-}
-
-func generateExtraNonce1() string {
-	return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+	log.Info().Str("job_id", job.JobID).Int64("height", job.Height).Msg("Broadcasted new job")
 }
