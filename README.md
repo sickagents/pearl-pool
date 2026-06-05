@@ -1,6 +1,29 @@
 # PEARL Mining Pool
 
-Production-ready Stratum mining pool for PEARL cryptocurrency (Proof-of-Useful-Work blockchain).
+Production-ready Stratum mining pool for PEARL coin with pearlhash proof-of-work algorithm.
+
+**Status:** MVP Complete (Priority 1 features implemented)
+
+## ⚠️ Important Notes
+
+### Block Construction (TODO)
+The pool currently has **placeholder block construction** in `pkg/stratum/block.go`. For production use, you need to implement:
+
+1. **Coinbase transaction construction** with extraNonce1+2
+2. **Merkle tree building** from coinbase + template transactions  
+3. **Block header serialization** (80 bytes: version, prevhash, merkleroot, timestamp, bits, nonce)
+4. **ZK certificate construction** (PEARL-specific: proof_data, public_data, commitment)
+5. **Full block serialization** to hex for `submitblock` RPC
+
+Reference: `/tmp/pearl/node/wire/msgblock.go` for PEARL block structure.
+
+### Share Validation (Simplified)
+Current implementation uses **simplified hash checking** for difficulty validation. For production:
+
+- Forward shares to PEARL node RPC for ZK proof validation (Option A: trusted node validation)
+- Or implement embedded Rust verifier via CGO (Option B: higher performance, more complexity)
+
+See `pkg/stratum/validation.go` for validation logic.
 
 ## Features
 
@@ -85,14 +108,85 @@ srbminer --algorithm pearlhash \
 
 ## Configuration
 
-### Pool Settings (`config.yaml`)
+### config.yaml
+
+Key settings in `config.yaml`:
 
 ```yaml
 pool:
-  name: "PEARL Mining Pool"
-  fee: 1.0                    # Pool fee percentage
-  rewardMode: "pplns"         # pplns or prop
-  pplnsWindow: 10000          # PPLNS share window
+  name: "PEARL Pool"
+  fee: 1.0                    # Pool fee percentage (1.0 = 1%)
+  min_payout: 1000000000      # Minimum payout threshold (10 PEARL = 1,000,000,000 satoshis)
+  payout_interval: 900        # Payout interval in seconds (900 = 15 minutes)
+  reward_mode: "pplns"        # "pplns" or "prop"
+  pplns_window: 100           # PPLNS window size (number of shares)
+  confirmation_depth: 100     # Blocks before reward is credited (PEARL default)
+
+node:
+  host: "localhost"           # PEARL node RPC host
+  port: 44107                 # PEARL node RPC port (default)
+  rpcuser: ""                 # Set via env var PEARL_NODE_USER
+  rpcpass: ""                 # Set via env var PEARL_NODE_PASS
+  tls: false                  # Use TLS for RPC connection
+  submit_timeout: 30          # Block submission timeout (seconds)
+
+stratum:
+  ports:
+    - port: 3360
+      difficulty: 2000000     # 2M difficulty (< 500 TH/s miners)
+    - port: 3361
+      difficulty: 4000000     # 4M difficulty (500-1000 TH/s)
+    - port: 3362
+      difficulty: 8000000     # 8M difficulty (1000+ TH/s)
+
+vardiff:
+  target_shares_per_min: 15   # Target share rate
+  retarget_interval: 120      # Retarget every 2 minutes
+  variance_percent: 30        # Allow 30% variance
+  min_difficulty: 1000000     # 1M minimum
+  max_difficulty: 100000000   # 100M maximum
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  enable_metrics: true
+  metrics_path: "/metrics"
+  cors_enabled: true
+  cors_origins: ["*"]
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "pearl_pool"
+  password: "pearl_pool_pass"  # Override via env var
+  database: "pearl_pool"
+  max_conns: 20
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+```
+
+### Environment Variables
+
+Override config via `.env`:
+
+```bash
+# PEARL Node
+PEARL_NODE_HOST=your_node_ip
+PEARL_NODE_PORT=44107
+PEARL_NODE_USER=your_rpc_user
+PEARL_NODE_PASS=your_rpc_password
+
+# Database
+PEARL_POOL_DATABASE_HOST=postgres
+PEARL_POOL_DATABASE_PASSWORD=pearl_pool_pass
+
+# Redis
+PEARL_POOL_REDIS_HOST=redis
+```
   minPayout: 10.0             # Minimum payout in PEARL
   confirmationDepth: 100      # Blocks to wait before crediting rewards
   soloMiningEnabled: true     # Allow solo: prefix
