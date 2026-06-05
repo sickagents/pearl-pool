@@ -15,15 +15,19 @@ import (
 )
 
 type Server struct {
-	port       int
-	listener   net.Listener
-	conns      map[string]*Connection
-	connsMu    sync.RWMutex
-	jobManager *JobManager
-	difficulty float64
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	port        int
+	listener    net.Listener
+	conns       map[string]*Connection
+	connsMu     sync.RWMutex
+	jobManager  *JobManager
+	difficulty  float64
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	dupChecker  *DuplicateShareChecker
+	rpcClient   interface{} // Will be *rpc.Client
+	pgStore     interface{} // Will be *storage.PostgresStore
+	redisStore  interface{} // Will be *storage.RedisStore
 }
 
 func NewServer(port int, difficulty float64, jobManager *JobManager) *Server {
@@ -35,7 +39,23 @@ func NewServer(port int, difficulty float64, jobManager *JobManager) *Server {
 		difficulty: difficulty,
 		ctx:        ctx,
 		cancel:     cancel,
+		dupChecker: NewDuplicateShareChecker(),
 	}
+}
+
+// SetRPCClient sets the RPC client for block submission
+func (s *Server) SetRPCClient(client interface{}) {
+	s.rpcClient = client
+}
+
+// SetPgStore sets the PostgreSQL store
+func (s *Server) SetPgStore(store interface{}) {
+	s.pgStore = store
+}
+
+// SetRedisStore sets the Redis store
+func (s *Server) SetRedisStore(store interface{}) {
+	s.redisStore = store
 }
 
 func (s *Server) Start() error {
@@ -220,9 +240,35 @@ func (s *Server) handleSubmit(conn *Connection, msg *StratumMessage) {
 	}
 	
 	// Params: [worker_name, job_id, extranonce2, ntime, nonce]
+	workerName, _ := msg.Params[0].(string)
 	jobID, ok := msg.Params[1].(string)
 	if !ok {
 		s.sendError(conn, msg.ID, 24, "Invalid job_id")
+		return
+	}
+	
+	extraNonce2, ok := msg.Params[2].(string)
+	if !ok {
+		s.sendError(conn, msg.ID, 24, "Invalid extranonce2")
+		return
+	}
+	
+	nTime, ok := msg.Params[3].(string)
+	if !ok {
+		s.sendError(conn, msg.ID, 24, "Invalid ntime")
+		return
+	}
+	
+	nonceStr, ok := msg.Params[4].(string)
+	if !ok {
+		s.sendError(conn, msg.ID, 24, "Invalid nonce")
+		return
+	}
+	
+	// Parse nonce
+	var nonce uint32
+	if _, err := fmt.Sscanf(nonceStr, "%x", &nonce); err != nil {
+		s.sendError(conn, msg.ID, 24, "Invalid nonce format")
 		return
 	}
 	
@@ -232,15 +278,88 @@ func (s *Server) handleSubmit(conn *Connection, msg *StratumMessage) {
 		return
 	}
 	
-	// TODO: Validate share (check nonce, extranonce2, compute hash)
-	// TODO: Check if meets pool difficulty
-	// TODO: Check if meets network difficulty (block found)
-	// TODO: Submit to accounting system
+	// Check for duplicate share
+	if s.dupChecker.Check(jobID, nonce, extraNonce2) {
+		s.sendError(conn, msg.ID, 22, "Duplicate share")
+		conn.sharesRejected++
+		return
+	}
+	
+	// Validate share
+	validation, err := ValidateShare(job, nonce, extraNonce2, nTime)
+	if err != nil {
+		s.sendError(conn, msg.ID, 23, fmt.Sprintf("Invalid share: %v", err))
+		conn.sharesRejected++
+		log.Warn().Str("conn_id", conn.ID).Str("address", conn.address).Err(err).Msg("Share validation failed")
+		return
+	}
+	
+	if !validation.Valid {
+		s.sendError(conn, msg.ID, 23, validation.ErrorReason)
+		conn.sharesRejected++
+		return
+	}
+	
+	// Share is valid
+	conn.sharesSubmitted++
+	conn.sharesAccepted++
+	
+	// Record share to storage
+	if s.pgStore != nil {
+		err := s.pgStore.RecordShare(
+			conn.address,
+			workerName,
+			conn.difficulty,
+			job.Height,
+			validation.MeetsDifficulty,
+			validation.BlockHash,
+		)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to record share")
+		}
+	}
+	
+	// If meets network difficulty, we found a block!
+	if validation.MeetsDifficulty {
+		log.Info().
+			Str("address", conn.address).
+			Str("block_hash", validation.BlockHash).
+			Int64("height", job.Height).
+			Msg("BLOCK FOUND!")
+		
+		// Submit block to node (will be implemented in block submission handler)
+		if s.rpcClient != nil {
+			go s.submitBlock(job, validation)
+		}
+		
+		// Record block in database
+		if s.pgStore != nil {
+			err := s.pgStore.RecordBlock(
+				validation.BlockHash,
+				job.Height,
+				job.CoinbaseValue,
+				conn.address,
+			)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to record block")
+			}
+		}
+	}
+	
+	// Update Redis stats
+	if s.redisStore != nil {
+		s.redisStore.IncrShareCount(conn.address)
+		s.redisStore.SetWorkerOnline(conn.address, workerName)
+	}
 	
 	s.sendResult(conn, msg.ID, true)
 	
-	conn.sharesSubmitted++
-	log.Debug().Str("conn_id", conn.ID).Str("job_id", jobID).Msg("Share submitted")
+	log.Debug().
+		Str("conn_id", conn.ID).
+		Str("address", conn.address).
+		Str("job_id", jobID).
+		Bool("block", validation.MeetsDifficulty).
+		Msg("Share accepted")
 }
 
 func (s *Server) handleExtraNonceSubscribe(conn *Connection, msg *StratumMessage) {

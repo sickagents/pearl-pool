@@ -106,6 +106,12 @@ func main() {
 	var servers []*stratum.Server
 	for _, portCfg := range cfg.Stratum.Ports {
 		server := stratum.NewServer(portCfg.Port, portCfg.Difficulty, jobManager)
+		
+		// Inject dependencies
+		server.SetRPCClient(rpcClient)
+		server.SetPgStore(pgStore)
+		server.SetRedisStore(redisStore)
+		
 		if err := server.Start(); err != nil {
 			log.Fatal().Err(err).Int("port", portCfg.Port).Msg("Failed to start Stratum server")
 		}

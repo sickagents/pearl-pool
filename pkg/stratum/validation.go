@@ -1,153 +1,159 @@
 package stratum
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 )
 
 // ValidateShare validates a submitted share
-func (s *Server) ValidateShare(conn *Connection, job *Job, extraNonce2, nTimeStr, nonceStr string) (*ShareResult, error) {
-	// Parse hex strings
+func ValidateShare(job *Job, nonce uint32, extraNonce2 string, nTime string) (*ShareValidation, error) {
+	// Parse extra nonce 2
 	extraNonce2Bytes, err := hex.DecodeString(extraNonce2)
 	if err != nil {
 		return nil, fmt.Errorf("invalid extranonce2: %w", err)
 	}
 	
-	if len(extraNonce2Bytes) != conn.extraNonce2Size {
-		return nil, fmt.Errorf("extranonce2 size mismatch: expected %d, got %d", conn.extraNonce2Size, len(extraNonce2Bytes))
-	}
-	
-	nTime, err := hex.DecodeString(nTimeStr)
+	// Parse nTime
+	nTimeBytes, err := hex.DecodeString(nTime)
 	if err != nil {
 		return nil, fmt.Errorf("invalid ntime: %w", err)
 	}
-	if len(nTime) != 4 {
+	
+	if len(nTimeBytes) != 4 {
 		return nil, fmt.Errorf("ntime must be 4 bytes")
 	}
 	
-	nonce, err := hex.DecodeString(nonceStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid nonce: %w", err)
-	}
-	if len(nonce) != 4 {
-		return nil, fmt.Errorf("nonce must be 4 bytes")
-	}
+	nTimeInt := binary.LittleEndian.Uint32(nTimeBytes)
 	
-	// Build full extranonce
-	extraNonce1Bytes, _ := hex.DecodeString(conn.extraNonce1)
-	fullExtraNonce := append(extraNonce1Bytes, extraNonce2Bytes...)
-	
-	// Construct block header
-	// For PEARL, block header structure:
-	// - version (4 bytes)
-	// - prev_block_hash (32 bytes)
-	// - merkle_root (32 bytes)
-	// - timestamp (4 bytes)
-	// - bits (4 bytes)
-	// - nonce (4 bytes)
-	// Total: 80 bytes (standard Bitcoin-style header)
-	
-	// Build coinbase transaction with extranonce
-	coinbaseTx := s.buildCoinbaseTx(job, fullExtraNonce, conn.address)
-	
-	// Calculate merkle root with coinbase + job transactions
-	merkleRoot := s.calculateMerkleRoot(coinbaseTx, job.Transactions)
-	
-	// Build block header
-	header := s.buildBlockHeader(job, merkleRoot, nTime, nonce)
-	
-	// For PEARL ZK proof validation:
-	// Option A (current): Forward to node RPC for validation
-	// Option B (future): Embed libzk_pow_ffi.a for local validation
-	
-	// We'll use Option A: construct full block and validate via node
-	blockHex := s.serializeBlock(header, coinbaseTx, job.Transactions)
-	
-	result := &ShareResult{
-		Valid:      false,
-		IsBlock:    false,
-		BlockHash:  "",
-		Difficulty: conn.difficulty,
+	// Validate nTime is not too far in the future or past
+	if int64(nTimeInt) > job.CurTime+7200 {
+		return nil, fmt.Errorf("ntime too far in future")
 	}
 	
-	// TODO: For now, accept all shares (trust miner)
-	// In production, MUST validate via node RPC or embedded verifier
-	result.Valid = true
-	
-	// Check if meets network difficulty (block found)
-	// This requires actual hash computation, which for PEARL means ZK proof
-	// For MVP: we'll submit every share to node and check response
-	
-	return result, nil
-}
-
-type ShareResult struct {
-	Valid      bool
-	IsBlock    bool
-	BlockHash  string
-	Difficulty float64
-}
-
-func (s *Server) buildCoinbaseTx(job *Job, extraNonce []byte, address string) []byte {
-	// Simplified coinbase construction
-	// Real implementation needs:
-	// - Version (4 bytes)
-	// - Input count (varint, usually 1)
-	// - Previous output (32 bytes of 0x00, index 0xffffffff)
-	// - Script length (varint)
-	// - Coinbase script (height + extranonce + arbitrary data)
-	// - Sequence (0xffffffff)
-	// - Output count (varint, usually 1)
-	// - Output value (8 bytes, coinbasevalue from template)
-	// - Output script length (varint)
-	// - Output script (P2TR for prl1 address)
-	// - Locktime (4 bytes, usually 0)
-	
-	// Placeholder: return dummy coinbase
-	// TODO: Proper BIP34 height encoding + extranonce injection
-	return []byte{}
-}
-
-func (s *Server) calculateMerkleRoot(coinbaseTx []byte, transactions [][]byte) []byte {
-	// Build merkle tree from coinbase + transactions
-	// TODO: Proper SHA256d merkle tree construction
-	return make([]byte, 32) // Placeholder
-}
-
-func (s *Server) buildBlockHeader(job *Job, merkleRoot []byte, nTime []byte, nonce []byte) []byte {
-	// Standard 80-byte block header
-	// TODO: Proper little-endian serialization
-	return make([]byte, 80) // Placeholder
-}
-
-func (s *Server) serializeBlock(header []byte, coinbaseTx []byte, transactions [][]byte) string {
-	// Serialize full block: header + txn_count + coinbase + transactions
-	// TODO: Proper Bitcoin block serialization
-	return "" // Placeholder
-}
-
-// DuplicateShareCheck checks if share was already submitted
-func (s *Server) isDuplicateShare(conn *Connection, jobID, extraNonce2, nonce string) bool {
-	// TODO: Track submitted shares in Redis with TTL
-	// Key: conn.address:jobID:extraNonce2:nonce
-	// TTL: job lifetime (e.g., 10 minutes)
-	return false
-}
-
-// StaleShareCheck checks if job is still valid
-func (s *Server) isStaleJob(job *Job) bool {
-	// Job is stale if it's not the current job and too old
-	currentJob := s.jobManager.GetCurrentJob()
-	if currentJob == nil {
-		return true
+	if int64(nTimeInt) < job.CurTime-7200 {
+		return nil, fmt.Errorf("ntime too far in past")
 	}
 	
-	// Allow submissions for current job and previous 2 jobs (to handle network latency)
-	if job.ID == currentJob.ID {
-		return false
+	// Compute block hash (simplified - real implementation needs full block construction)
+	// For PEARL, this would construct the block header with ZK certificate
+	// and compute the hash for difficulty check
+	
+	// NOTE: This is a placeholder. Real implementation requires:
+	// 1. Construct coinbase transaction with extraNonce1 + extraNonce2
+	// 2. Build merkle tree with coinbase + template transactions
+	// 3. Construct block header with merkle root
+	// 4. Compute block hash
+	// 5. Check hash meets difficulty target
+	
+	blockHash := computeBlockHash(job, nonce, extraNonce2Bytes, nTimeInt)
+	
+	// Check if meets difficulty
+	meetsDifficulty := checkDifficulty(blockHash, job.Target)
+	
+	return &ShareValidation{
+		Valid:           true,
+		BlockHash:       hex.EncodeToString(blockHash),
+		MeetsDifficulty: meetsDifficulty,
+		Nonce:           nonce,
+		ExtraNonce2:     extraNonce2,
+		NTime:           nTimeInt,
+	}, nil
+}
+
+// ShareValidation represents validation result
+type ShareValidation struct {
+	Valid           bool
+	BlockHash       string
+	MeetsDifficulty bool
+	Nonce           uint32
+	ExtraNonce2     string
+	NTime           uint32
+	ErrorReason     string
+}
+
+// computeBlockHash computes block hash (placeholder)
+func computeBlockHash(job *Job, nonce uint32, extraNonce2 []byte, nTime uint32) []byte {
+	// PLACEHOLDER: Real implementation needs full block header construction
+	// This is simplified for MVP - actual hash comes from PEARL node validation
+	
+	h := sha256.New()
+	h.Write([]byte(job.PrevHash))
+	h.Write([]byte(job.MerkleRoot))
+	
+	nonceBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(nonceBytes, nonce)
+	h.Write(nonceBytes)
+	
+	h.Write(extraNonce2)
+	
+	timeBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(timeBytes, nTime)
+	h.Write(timeBytes)
+	
+	return h.Sum(nil)
+}
+
+// checkDifficulty checks if hash meets target difficulty
+func checkDifficulty(hash []byte, target *big.Int) bool {
+	// Convert hash to big.Int (little-endian)
+	hashInt := new(big.Int).SetBytes(reverseBytes(hash))
+	
+	// Hash must be less than target
+	return hashInt.Cmp(target) < 0
+}
+
+// reverseBytes reverses byte slice
+func reverseBytes(b []byte) []byte {
+	reversed := make([]byte, len(b))
+	for i := range b {
+		reversed[i] = b[len(b)-1-i]
+	}
+	return reversed
+}
+
+// DuplicateShareChecker tracks recent shares to prevent duplicates
+type DuplicateShareChecker struct {
+	recent map[string]bool
+	mu     sync.RWMutex
+}
+
+// NewDuplicateShareChecker creates a new checker
+func NewDuplicateShareChecker() *DuplicateShareChecker {
+	return &DuplicateShareChecker{
+		recent: make(map[string]bool),
+	}
+}
+
+// Check checks if share is duplicate
+func (d *DuplicateShareChecker) Check(jobID string, nonce uint32, extraNonce2 string) bool {
+	key := fmt.Sprintf("%s-%d-%s", jobID, nonce, extraNonce2)
+	
+	d.mu.RLock()
+	exists := d.recent[key]
+	d.mu.RUnlock()
+	
+	if exists {
+		return true // duplicate
 	}
 	
-	// Check if job is in manager's cache
-	_, exists := s.jobManager.GetJob(job.ID)
-	return !exists
+	d.mu.Lock()
+	d.recent[key] = true
+	
+	// Cleanup old entries (simple approach - keep last 10000)
+	if len(d.recent) > 10000 {
+		// Remove oldest half
+		count := 0
+		for k := range d.recent {
+			delete(d.recent, k)
+			count++
+			if count > 5000 {
+				break
+			}
+		}
+	}
+	d.mu.Unlock()
+	
+	return false // not duplicate
 }

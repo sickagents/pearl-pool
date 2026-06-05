@@ -92,6 +92,26 @@ services:
       - ./config.yaml:/etc/pearl-pool/config.yaml:ro
     restart: unless-stopped
 
+  blockworker:
+    build: .
+    command: /app/blockworker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PEARL_POOL_NODE_HOST: ${PEARL_NODE_HOST:-localhost}
+      PEARL_POOL_NODE_PORT: ${PEARL_NODE_PORT:-44107}
+      PEARL_POOL_NODE_RPCUSER: ${PEARL_NODE_USER}
+      PEARL_POOL_NODE_RPCPASS: ${PEARL_NODE_PASS}
+      PEARL_POOL_DATABASE_HOST: postgres
+      PEARL_POOL_DATABASE_PASSWORD: pearl_pool_pass
+      PEARL_POOL_REDIS_HOST: redis
+    volumes:
+      - ./config.yaml:/etc/pearl-pool/config.yaml:ro
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
