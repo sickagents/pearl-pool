@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pearl-mining/pearl-pool/pkg/accounting"
 	"github.com/pearl-mining/pearl-pool/pkg/config"
 	"github.com/pearl-mining/pearl-pool/pkg/rpc"
 	"github.com/pearl-mining/pearl-pool/pkg/storage"
@@ -93,6 +94,14 @@ func main() {
 	}
 	log.Info().Str("job_id", job.ID).Int64("height", job.Height).Msg("Initial job created")
 	
+	// Initialize accounting
+	calculator := accounting.NewRewardCalculator(
+		cfg.Pool.RewardMode,
+		cfg.Pool.PPLNSWindow,
+		cfg.Pool.Fee,
+		cfg.Pool.ConfirmationDepth,
+	)
+	
 	// Start Stratum servers
 	var servers []*stratum.Server
 	for _, portCfg := range cfg.Stratum.Ports {
@@ -102,6 +111,22 @@ func main() {
 		}
 		servers = append(servers, server)
 	}
+	
+	// Start block confirmation loop
+	confirmationLoop := NewBlockConfirmationLoop(
+		rpcClient,
+		pgStore,
+		calculator,
+		cfg.Pool.ConfirmationDepth,
+		1*time.Minute, // Check every minute
+	)
+	confirmationLoop.Start()
+	defer confirmationLoop.Stop()
+	
+	// Start stats collector
+	statsCollector := NewStatsCollector(pgStore, redisStore, 30*time.Second)
+	statsCollector.Start()
+	defer statsCollector.Stop()
 	
 	// Start block template poller
 	ctx, cancel := context.WithCancel(context.Background())
