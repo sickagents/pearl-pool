@@ -13,23 +13,17 @@ import (
 
 	"github.com/rs/zerolog/log"
 )
-	"github.com/rs/zerolog/log"
-)
 
 type Server struct {
-	port        int
-	listener    net.Listener
-	conns       map[string]*Connection
-	connsMu     sync.RWMutex
-	jobManager  *JobManager
-	difficulty  float64
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	dupChecker  *DuplicateShareChecker
-	rpcClient   interface{} // Will be *rpc.Client
-	pgStore     interface{} // Will be *storage.PostgresStore
-	redisStore  interface{} // Will be *storage.RedisStore
+	port       int
+	listener   net.Listener
+	conns      map[string]*Connection
+	connsMu    sync.RWMutex
+	jobManager *JobManager
+	difficulty float64
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 func NewServer(port int, difficulty float64, jobManager *JobManager) *Server {
@@ -41,23 +35,7 @@ func NewServer(port int, difficulty float64, jobManager *JobManager) *Server {
 		difficulty: difficulty,
 		ctx:        ctx,
 		cancel:     cancel,
-		dupChecker: NewDuplicateShareChecker(),
 	}
-}
-
-// SetRPCClient sets the RPC client for block submission
-func (s *Server) SetRPCClient(client interface{}) {
-	s.rpcClient = client
-}
-
-// SetPgStore sets the PostgreSQL store
-func (s *Server) SetPgStore(store interface{}) {
-	s.pgStore = store
-}
-
-// SetRedisStore sets the Redis store
-func (s *Server) SetRedisStore(store interface{}) {
-	s.redisStore = store
 }
 
 func (s *Server) Start() error {
@@ -123,19 +101,11 @@ func (s *Server) acceptLoop() {
 
 func (s *Server) handleConnection(conn *Connection) {
 	defer s.wg.Done()
-	
-	// Record connection
-	metrics.RecordConnection(strconv.Itoa(s.port))
-	
 	defer func() {
 		conn.Close()
 		s.connsMu.Lock()
 		delete(s.conns, conn.ID)
-		activeCount := len(s.conns)
 		s.connsMu.Unlock()
-		
-		// Update active connections
-		metrics.UpdateActiveConnections(strconv.Itoa(s.port), activeCount)
 	}()
 	
 	log.Info().Str("conn_id", conn.ID).Str("remote", conn.RemoteAddr()).Msg("New connection")
@@ -255,7 +225,7 @@ func (s *Server) handleSubmit(conn *Connection, msg *StratumMessage) {
 		return
 	}
 	
-	nTime, ok := msg.Params[3].(string)
+	ntimeStr, ok := msg.Params[3].(string)
 	if !ok {
 		s.sendError(conn, msg.ID, 24, "Invalid ntime")
 		return
@@ -267,101 +237,53 @@ func (s *Server) handleSubmit(conn *Connection, msg *StratumMessage) {
 		return
 	}
 	
-	// Parse nonce
-	var nonce uint32
-	if _, err := fmt.Sscanf(nonceStr, "%x", &nonce); err != nil {
-		s.sendError(conn, msg.ID, 24, "Invalid nonce format")
-		return
-	}
-	
 	job, exists := s.jobManager.GetJob(jobID)
 	if !exists {
 		s.sendError(conn, msg.ID, 21, "Job not found")
 		return
 	}
 	
-	// Check for duplicate share
-	if s.dupChecker.Check(jobID, nonce, extraNonce2) {
-		s.sendError(conn, msg.ID, 22, "Duplicate share")
-		conn.sharesRejected++
+	// Parse nonce and ntime
+	nonceBytes, err := hex.DecodeString(nonceStr)
+	if err != nil || len(nonceBytes) != 4 {
+		s.sendError(conn, msg.ID, 24, "Invalid nonce format")
 		return
 	}
+	nonce := binary.LittleEndian.Uint32(nonceBytes)
+	
+	ntimeBytes, err := hex.DecodeString(ntimeStr)
+	if err != nil || len(ntimeBytes) != 4 {
+		s.sendError(conn, msg.ID, 24, "Invalid ntime format")
+		return
+	}
+	ntime := int64(binary.LittleEndian.Uint32(ntimeBytes))
 	
 	// Validate share
-	validation, err := ValidateShare(job, nonce, extraNonce2, nTime)
+	share, err := ValidateShare(job, nonce, extraNonce2, ntime, conn.address, conn.difficulty)
 	if err != nil {
-		s.sendError(conn, msg.ID, 23, fmt.Sprintf("Invalid share: %v", err))
+		s.sendError(conn, msg.ID, 23, err.Error())
 		conn.sharesRejected++
-		log.Warn().Str("conn_id", conn.ID).Str("address", conn.address).Err(err).Msg("Share validation failed")
+		log.Warn().Str("conn_id", conn.ID).Str("address", conn.address).Err(err).Msg("Share rejected")
 		return
 	}
 	
-	if !validation.Valid {
-		s.sendError(conn, msg.ID, 23, validation.ErrorReason)
-		conn.sharesRejected++
-		return
-	}
+	share.Worker = workerName
 	
-	// Share is valid
+	// Accept share
+	s.sendResult(conn, msg.ID, true)
 	conn.sharesSubmitted++
 	conn.sharesAccepted++
 	
-	// Record share to storage
-	if s.pgStore != nil {
-		err := s.pgStore.RecordShare(
-			conn.address,
-			workerName,
-			conn.difficulty,
-			job.Height,
-			validation.MeetsDifficulty,
-			validation.BlockHash,
-		)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to record share")
-		}
+	// TODO: Record to storage (pg + redis)
+	// s.storage.RecordShare(share)
+	
+	if share.IsBlock {
+		log.Info().Str("hash", share.BlockHash).Int64("height", share.Height).Str("finder", share.Miner).Msg("BLOCK FOUND!")
+		// TODO: Submit block to node
+		// s.rpcClient.SubmitBlock(blockHex)
 	}
 	
-	// If meets network difficulty, we found a block!
-	if validation.MeetsDifficulty {
-		log.Info().
-			Str("address", conn.address).
-			Str("block_hash", validation.BlockHash).
-			Int64("height", job.Height).
-			Msg("BLOCK FOUND!")
-		
-		// Submit block to node (will be implemented in block submission handler)
-		if s.rpcClient != nil {
-			go s.submitBlock(job, validation)
-		}
-		
-		// Record block in database
-		if s.pgStore != nil {
-			err := s.pgStore.RecordBlock(
-				validation.BlockHash,
-				job.Height,
-				job.CoinbaseValue,
-				conn.address,
-			)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to record block")
-			}
-		}
-	}
-	
-	// Update Redis stats
-	if s.redisStore != nil {
-		s.redisStore.IncrShareCount(conn.address)
-		s.redisStore.SetWorkerOnline(conn.address, workerName)
-	}
-	
-	s.sendResult(conn, msg.ID, true)
-	
-	log.Debug().
-		Str("conn_id", conn.ID).
-		Str("address", conn.address).
-		Str("job_id", jobID).
-		Bool("block", validation.MeetsDifficulty).
-		Msg("Share accepted")
+	log.Debug().Str("conn_id", conn.ID).Str("job_id", jobID).Float64("diff", share.Difficulty).Bool("block", share.IsBlock).Msg("Share accepted")
 }
 
 func (s *Server) handleExtraNonceSubscribe(conn *Connection, msg *StratumMessage) {
