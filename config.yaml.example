@@ -1,0 +1,70 @@
+pool:
+  name: "PEARL Mining Pool"
+  fee: 1.0
+  rewardMode: "pplns"
+  pplnsWindow: 10000
+  minPayout: 10.0
+  payoutInterval: "15m"
+  confirmationDepth: 100
+  soloMiningEnabled: true
+  maxWorkersPerMiner: 100
+  shareDifficultyBase: 2000000.0
+
+node:
+  host: "localhost"
+  port: 44107
+  rpcUser: "rpcuser"
+  rpcPass: "rpcpass"
+  tls: true
+  pollInterval: "30s"
+  submitTimeout: "10s"
+  validationMode: "node"
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "pearl_pool"
+  password: "pearl_pool_pass"
+  database: "pearl_pool"
+  maxConns: 50
+  maxIdleConns: 10
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+
+stratum:
+  ports:
+    - port: 3360
+      tls: false
+      difficulty: 2000000.0
+      maxHashrate: 500000000000000
+    - port: 3361
+      tls: false
+      difficulty: 4000000.0
+      maxHashrate: 1000000000000000
+    - port: 3362
+      tls: false
+      difficulty: 8000000.0
+      maxHashrate: 0
+
+payout:
+  enabled: true
+  interval: "15m"
+  minPayout: 10.0
+  maxBatchSize: 50
+  gasBuffer: 0.1
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  tls: false
+  certFile: ""
+  keyFile: ""
+  enableMetrics: true
+  metricsPath: "/metrics"
+  corsEnabled: true
+  corsOrigins:
+    - "*"
