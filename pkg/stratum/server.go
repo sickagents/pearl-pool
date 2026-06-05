@@ -101,11 +101,19 @@ func (s *Server) acceptLoop() {
 
 func (s *Server) handleConnection(conn *Connection) {
 	defer s.wg.Done()
+	
+	// Record connection
+	metrics.RecordConnection(strconv.Itoa(s.port))
+	
 	defer func() {
 		conn.Close()
 		s.connsMu.Lock()
 		delete(s.conns, conn.ID)
+		activeCount := len(s.conns)
 		s.connsMu.Unlock()
+		
+		// Update active connections
+		metrics.UpdateActiveConnections(strconv.Itoa(s.port), activeCount)
 	}()
 	
 	log.Info().Str("conn_id", conn.ID).Str("remote", conn.RemoteAddr()).Msg("New connection")
